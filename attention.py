@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import einops
 import numpy as np
 
-def scaled_dot_product_attention(q, k, v, d_h):
+def scaled_dot_product_attention(q, k, v, d_h, mask=False):
     """ Scaled dot product attention """
     # Q is (B, S, d_k) K is (B, S, d_k), K^T is
     # (B, d_k, S) and so Q @ K^T 
@@ -15,16 +15,22 @@ def scaled_dot_product_attention(q, k, v, d_h):
     k_t = einops.rearrange(k, 'B K S -> B S K')
     qk = einops.einsum(q, k_t, 'B S K, B K L -> B S L')
     qk_dk = qk / np.sqrt(d_h)
+
+    if mask:
+        mask_idx = torch.tril_indices(qk_dk.shape[1], qk_dk.shape[2])
+        qk_dk[:, mask_idx[0], mask_idx[1]] = float("-inf")
+
     qk_dk = torch.nn.functional.softmax(qk_dk, dim = 2)
     return einops.einsum(qk_dk, v, 'B S I, B I K -> B S K')
 
 
 class MultiHeadAttention(nn.Module):
     """ Multi head attention """
-    def __init__(self,num_heads = 8, d_model = 512):
+    def __init__(self,num_heads = 8, d_model = 512, mask=False):
         super().__init__()
         self.num_heads = num_heads
         self.d_model = d_model
+        self.mask = mask
         # Q, K, and V are all size B, S, d_model project to different heads
         self.d_k = d_model // num_heads
         self.head_q = torch.nn.ParameterList(torch.nn.Parameter(torch.empty(d_model, self.d_k)) for n in range(num_heads))
@@ -46,7 +52,8 @@ class MultiHeadAttention(nn.Module):
                 torch.matmul(q, self.head_q[i]),
                 torch.matmul(k, self.head_k[i]),
                 torch.matmul(v, self.head_v[i]),
-                self.d_k
+                self.d_k,
+                self.mask
             ) # (B, S, d_k)
             concat.append(attn) 
         
@@ -63,7 +70,6 @@ class FeedForwardNet(nn.Module):
 
 def positional_encoding_get_val(pos, i, d_model):
     """ Fxn to create the value of the positional encoding """
-    pos = torch.tensor(pos, dtype=torch.float32)
     if i % 2 == 0:
         return torch.sin(pos/(10000 ** (2 * (i // 2) / d_model)))
     else:
@@ -88,48 +94,31 @@ class TransformerEncoder(nn.Module):
         self.d_ff = d_ff
 
         # Input to embedding is (B, S) and output is (B, S, d_E)
-        self.input_embedding = torch.nn.Embedding(num_embeddings = vocab_size, embedding_dim = d_model) 
-        self.MHA = self.ModuleList([
+        self.MHA = torch.nn.ModuleList([
             MultiHeadAttention(num_heads = self.num_heads, d_model = self.d_model) for i in range(n)
         ])
 
-        self.FFN = self.ModuleList([
+        self.FFN = torch.nn.ModuleList([
             FeedForwardNet(d_model = self.d_model, d_ff = self.d_ff) for i in range(n)
         ])
         
-        self.LN_First = self.ModuleList([
+        self.LN_First = torch.nn.ModuleList([
             torch.nn.LayerNorm(d_model) for i in range(n)
         ])
 
-        self.LN_Second = self.ModuleList([
+        self.LN_Second = torch.nn.ModuleList([
             torch.nn.LayerNorm(d_model) for i in range(n)
         ])
 
         return
 
     def forward(self, x):
-
-        # Get input embedding (B, S)
-        out = self.input_embedding(x)
-        # Scale input by sqrt(d_model), (B, S, d_E)
-        out *= np.sqrt(d_model)
-
-        # Add positional encoding tensor (B, S, d_E or d_model)
-        shape = out.shape
-
-        # Create pos encoding tensor
-        pos_encoding = positional_encoding_get_tensor(shape[1], shape[2]).to(out.device)
-
-        # Add pos encoding tensor by first adding batch dim slot and then expanding B times.
-        out += pos_encoding.unsqueeze(0).expand(shape[0], *pos_encoding.shape)
-
         for i in range(self.num_layers):
-            attn_out = self.MHA[i](out, out, out) # (B, S, d_E)
-            ln_one_out = self.LN_First(out + attn_out)
+            attn_out = self.MHA[i](x) # (B, S, d_E)
+            ln_one_out = self.LN_First[i](x + attn_out)
             
             ffn_out = self.FFN[i](ln_one_out)
-            out = self.LN_Second(ln_one_out + ffn_out)
-
+            x = self.LN_Second[i](ln_one_out + ffn_out)
         return out
 
 
@@ -145,61 +134,80 @@ class TransformerDecoder(nn.Module):
         self.d_ff = d_ff
 
         # Input to embedding is (B, S) and output is (B, S, d_E)
-        self.input_embedding = torch.nn.Embedding(num_embeddings = vocab_size, embedding_dim = d_model) 
-        self.MHA = self.ModuleList([
+        self.MHA = torch.nn.ModuleList([
             MultiHeadAttention(num_heads = self.num_heads, d_model = self.d_model) for i in range(n)
         ])
 
-        self.CrossAttention = self.ModuleList([
+        self.CrossAttention = torch.nn.ModuleList([
             MultiHeadAttention(num_heads = self.num_heads, d_model = self.d_model) for i in range(n)
         ])
 
-        self.FFN = self.ModuleList([
+        self.FFN = torch.nn.ModuleList([
             FeedForwardNet(d_model = self.d_model, d_ff = self.d_ff) for i in range(n)
         ])
         
-        self.LN_First = self.ModuleList([
+        self.LN_First = torch.nn.ModuleList([
             torch.nn.LayerNorm(d_model) for i in range(n)
         ])
 
-        self.LN_Second = self.ModuleList([
+        self.LN_Second = torch.nn.ModuleList([
             torch.nn.LayerNorm(d_model) for i in range(n)
         ])
         
-        self.LN_Third = self.ModuleList([
+        self.LN_Third = torch.nn.ModuleList([
             torch.nn.LayerNorm(d_model) for i in range(n)
         ])
 
     def forward(self, out_encoder, x):
-        # Get input embedding (B, S)
-        out = self.input_embedding(x)
-        # Scale input by sqrt(d_model), (B, S, d_E)
-        out *= np.sqrt(d_model)
-        # Add positional encoding tensor (B, S, d_E or d_model)
-        shape = out.shape
-        # Create pos encoding tensor
-        pos_encoding = positional_encoding_get_tensor(shape[1], shape[2]).to(out.device)
-
-        # Add pos encoding tensor by first adding batch dim slot and then expanding B times.
-        out += pos_encoding.unsqueeze(0).expand(shape[0], *pos_encoding.shape)
-
         for i in range(self.num_layers):
-            attn_out = self.MHA[i](out, out, out) # (B, S, d_E)
-            ln_one_out = self.LN_First(out + attn_out)
+            attn_out = self.MHA[i](x, x, x, mask=True) # (B, S, d_E)
+            ln_one_out = self.LN_First[i](x + attn_out)
 
             cross_attn_out = self.CrossAttention[i](ln_one_out,out_encoder, out_encoder)
-            ln_two_out = self.LN_Second(ln_one_out + cross_attn_out)
+            ln_two_out = self.LN_Second[i](ln_one_out + cross_attn_out)
 
             
             ffn_out = self.FFN[i](ln_two_out)
-            out = self.LN_Third(ln_two_out + ffn_out)
-
+            x = self.LN_Third[i](ln_two_out + ffn_out)
+        return x
 
 
 class Transformer(nn.Module):
-    def __init__(self):
+    def __init__(self,d_model = 512, num_heads = 8, n=6, vocab_size = 10000,
+                 d_ff = 2048):
         super().__init__()
+        self.input_embedding_src = torch.nn.Embedding(num_embeddings = vocab_size, embedding_dim = d_model) 
+        self.input_embedding_tgt = torch.nn.Embedding(num_embeddings = vocab_size, embedding_dim = d_model) 
+        self.transformer_encoder =  TransformerEncoder()
+        self.transformer_decoder = TransformerDecoder()
+        self.lin_layer = torch.nn.Linear(d_model, vocab_size)
+
         return
 
     def forward(self, src_seq, target_seq):
+        # Get input embedding (B, S)
+        src_seq = self.input_embedding(src_seq)
+        tgt_seq = self.input_embedding_tg(tgt_seq)
+        # Scale input by sqrt(d_model), (B, S, d_E)
+        src_seq *= np.sqrt(self.d_model)
+        tgt_seq *= np.sqrt(self.d_model)
+        # Add positional encoding tensor (B, S, d_E or d_model)
+        src_shape = src_seq.shape
+        tgt_shape = tgt_seq.shape
 
+        # Create pos encoding tensor
+        pos_encoding = positional_encoding_get_tensor(src_shape[1], src_shape[2]).to(sqr_seq.device)
+        pos_encoding = positional_encoding_get_tensor(tgt_shape[1], tgt_shape[2]).to(sqr_seq.device)
+
+        # Add pos encoding tensor by first adding batch dim slot and then expanding B times.
+        src_seq += pos_encoding.unsqueeze(0).expand(src_shape[0], *pos_encoding.src_shape)
+        tgt_seq += pos_encoding.unsqueeze(0).expand(tgt_shape[0], *pos_encoding.tgt_shape)
+        
+        # Call encoder
+        src_encoding = self.transformer_encoder(src_seq)
+
+        # Call Decoder
+        out = self.transformer_decoder(src_encoding, target_seq)
+        out = self.lin_layer(out)
+
+        return out
