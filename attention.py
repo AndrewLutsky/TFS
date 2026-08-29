@@ -14,10 +14,10 @@ def scaled_dot_product_attention(q, k, v, d_h, mask=False):
     # Q @ K.T is B x d_k @ d_k x B so B x B
     k_t = einops.rearrange(k, 'B K S -> B S K')
     qk = einops.einsum(q, k_t, 'B S K, B K L -> B S L')
-    qk_dk = qk / np.sqrt(d_h)
+    qk_dk = qk / torch.sqrt(d_h)
 
     if mask:
-        mask_idx = torch.tril_indices(qk_dk.shape[1], qk_dk.shape[2])
+        mask_idx = torch.triu_indices(qk_dk.shape[1], qk_dk.shape[2], offset=1)
         qk_dk[:, mask_idx[0], mask_idx[1]] = float("-inf")
 
     qk_dk = torch.nn.functional.softmax(qk_dk, dim = 2)
@@ -114,12 +114,12 @@ class TransformerEncoder(nn.Module):
 
     def forward(self, x):
         for i in range(self.num_layers):
-            attn_out = self.MHA[i](x) # (B, S, d_E)
+            attn_out = self.MHA[i](x, x, x) # (B, S, d_E)
             ln_one_out = self.LN_First[i](x + attn_out)
             
             ffn_out = self.FFN[i](ln_one_out)
             x = self.LN_Second[i](ln_one_out + ffn_out)
-        return out
+        return x 
 
 
 class TransformerDecoder(nn.Module):
@@ -186,8 +186,8 @@ class Transformer(nn.Module):
 
     def forward(self, src_seq, target_seq):
         # Get input embedding (B, S)
-        src_seq = self.input_embedding(src_seq)
-        tgt_seq = self.input_embedding_tg(tgt_seq)
+        src_seq = self.input_embedding_src(src_seq)
+        tgt_seq = self.input_embedding_tgt(tgt_seq)
         # Scale input by sqrt(d_model), (B, S, d_E)
         src_seq *= np.sqrt(self.d_model)
         tgt_seq *= np.sqrt(self.d_model)
@@ -196,12 +196,12 @@ class Transformer(nn.Module):
         tgt_shape = tgt_seq.shape
 
         # Create pos encoding tensor
-        pos_encoding = positional_encoding_get_tensor(src_shape[1], src_shape[2]).to(sqr_seq.device)
-        pos_encoding = positional_encoding_get_tensor(tgt_shape[1], tgt_shape[2]).to(sqr_seq.device)
+        pos_encoding = positional_encoding_get_tensor(src_shape[1], src_shape[2]).to(src_seq.device)
+        pos_encoding = positional_encoding_get_tensor(tgt_shape[1], tgt_shape[2]).to(tgt_seq.device)
 
         # Add pos encoding tensor by first adding batch dim slot and then expanding B times.
-        src_seq += pos_encoding.unsqueeze(0).expand(src_shape[0], *pos_encoding.src_shape)
-        tgt_seq += pos_encoding.unsqueeze(0).expand(tgt_shape[0], *pos_encoding.tgt_shape)
+        src_seq += pos_encoding.unsqueeze(0).expand(src_shape[0], *pos_encoding.shape)
+        tgt_seq += pos_encoding.unsqueeze(0).expand(tgt_shape[0], *pos_encoding.shape)
         
         # Call encoder
         src_encoding = self.transformer_encoder(src_seq)
